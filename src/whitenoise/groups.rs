@@ -25,6 +25,20 @@ mod publish;
 pub use membership::{GroupWithInfoAndMembership, GroupWithMembership};
 
 impl Whitenoise {
+    fn key_package_incompatibility_error(
+        context: &'static str,
+        failures: &[(PublicKey, WhitenoiseError)],
+    ) -> WhitenoiseError {
+        let details = failures
+            .iter()
+            .map(|(pubkey, reason)| format!("{pubkey}: {reason}"))
+            .collect::<Vec<String>>()
+            .join("; ");
+        WhitenoiseError::InvalidInput(format!(
+            "Incompatible key package(s) while {context}: {details}"
+        ))
+    }
+
     async fn resolve_member_delivery_relays(
         &self,
         member: &User,
@@ -67,22 +81,19 @@ impl Whitenoise {
         Ok(fallback_relays)
     }
 
-    fn validate_fetched_member_key_package(event: &Event, pk: &PublicKey) -> Result<()> {
+    fn validate_fetched_member_key_package(
+        event: &Event,
+        pk: &PublicKey,
+        expected_ciphersuite: &str,
+    ) -> Result<()> {
         if event.pubkey != *pk {
             return Err(WhitenoiseError::InvalidInput(format!(
-                "Fetched key package event {} signed by {} instead of expected {}",
+                "key package event {} is signed by {} instead of expected {}",
                 event.id, event.pubkey, pk
             )));
         }
 
-        validate_marmot_key_package_tags(event, REQUIRED_MLS_CIPHERSUITE_TAG).map_err(|e| {
-            WhitenoiseError::InvalidInput(format!(
-                "Incompatible key package event {} for member {}: {}",
-                event.id, pk, e
-            ))
-        })?;
-
-        Ok(())
+        validate_marmot_key_package_tags(event, expected_ciphersuite)
     }
 
     /// Creates a new MLS group with the specified members and settings
@@ -103,6 +114,7 @@ impl Whitenoise {
 
         let mut key_package_events: Vec<Event> = Vec::new();
         let mut members = Vec::new();
+        let mut incompatible_members: Vec<(PublicKey, WhitenoiseError)> = Vec::new();
 
         for pk in member_pubkeys.iter() {
             let (mut user, created) = User::find_or_create_by_pubkey(pk, &self.database).await?;
@@ -154,10 +166,24 @@ impl Whitenoise {
                 mdk_core::Error::KeyPackage("Does not exist".to_owned()),
             ))?;
 
-            Self::validate_fetched_member_key_package(&event, pk)?;
+            match Self::validate_fetched_member_key_package(
+                &event,
+                pk,
+                REQUIRED_MLS_CIPHERSUITE_TAG,
+            ) {
+                Ok(()) => {
+                    key_package_events.push(event);
+                    members.push(user);
+                }
+                Err(error) => incompatible_members.push((*pk, error)),
+            }
+        }
 
-            key_package_events.push(event);
-            members.push(user);
+        if !incompatible_members.is_empty() {
+            return Err(Self::key_package_incompatibility_error(
+                "creating group",
+                &incompatible_members,
+            ));
         }
 
         tracing::debug!("Succefully fetched the key packages of members");
@@ -471,6 +497,7 @@ impl Whitenoise {
         let signer = self.get_signer_for_account(account)?;
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         let mut users = Vec::new();
+        let mut incompatible_members: Vec<(PublicKey, WhitenoiseError)> = Vec::new();
 
         // Fetch key packages for all members
         for pk in members.iter() {
@@ -498,10 +525,24 @@ impl Whitenoise {
                 mdk_core::Error::KeyPackage("Does not exist".to_owned()),
             ))?;
 
-            Self::validate_fetched_member_key_package(&event, pk)?;
+            match Self::validate_fetched_member_key_package(
+                &event,
+                pk,
+                REQUIRED_MLS_CIPHERSUITE_TAG,
+            ) {
+                Ok(()) => {
+                    key_package_events.push(event);
+                    users.push(user);
+                }
+                Err(error) => incompatible_members.push((*pk, error)),
+            }
+        }
 
-            key_package_events.push(event);
-            users.push(user);
+        if !incompatible_members.is_empty() {
+            return Err(Self::key_package_incompatibility_error(
+                "adding members to group",
+                &incompatible_members,
+            ));
         }
 
         let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
@@ -692,6 +733,93 @@ mod tests {
     use mdk_core::media_processing::MediaProcessingOptions;
     use mdk_storage_traits::Secret;
     use nostr_sdk::RelayUrl;
+
+    fn create_compatible_key_package_event(keys: &Keys) -> Event {
+        EventBuilder::new(Kind::MlsKeyPackage, "dGVzdF9jb250ZW50")
+            .tag(Tag::custom(
+                TagKind::Custom("mls_ciphersuite".into()),
+                [REQUIRED_MLS_CIPHERSUITE_TAG],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_extensions".into()),
+                ["0x000a", "0xf2ee"],
+            ))
+            .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
+            .sign_with_keys(keys)
+            .unwrap()
+    }
+
+    #[test]
+    fn test_validate_fetched_member_key_package_rejects_wrong_signer() {
+        let expected_keys = Keys::generate();
+        let wrong_signer_keys = Keys::generate();
+        let event = create_compatible_key_package_event(&wrong_signer_keys);
+
+        let result = Whitenoise::validate_fetched_member_key_package(
+            &event,
+            &expected_keys.public_key(),
+            REQUIRED_MLS_CIPHERSUITE_TAG,
+        );
+
+        assert!(
+            result.is_err(),
+            "Expected key package validation to fail for wrong signer"
+        );
+        match result.unwrap_err() {
+            WhitenoiseError::InvalidInput(msg) => {
+                assert!(
+                    msg.contains("is signed by") && msg.contains("instead of expected"),
+                    "Unexpected error message: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected InvalidInput for wrong signer, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_fetched_member_key_package_accepts_matching_signer_and_tags() {
+        let keys = Keys::generate();
+        let event = create_compatible_key_package_event(&keys);
+
+        let result = Whitenoise::validate_fetched_member_key_package(
+            &event,
+            &keys.public_key(),
+            REQUIRED_MLS_CIPHERSUITE_TAG,
+        );
+
+        assert!(
+            result.is_ok(),
+            "Expected key package validation to pass for valid event"
+        );
+    }
+
+    #[test]
+    fn test_key_package_incompatibility_error_includes_context_and_reasons() {
+        let failures = vec![
+            (
+                Keys::generate().public_key(),
+                WhitenoiseError::MissingEncodingTag,
+            ),
+            (
+                Keys::generate().public_key(),
+                WhitenoiseError::InvalidInput("wrong signer".to_string()),
+            ),
+        ];
+
+        let error = Whitenoise::key_package_incompatibility_error("creating group", &failures);
+        match error {
+            WhitenoiseError::InvalidInput(message) => {
+                assert!(message.contains("Incompatible key package(s) while creating group"));
+                assert!(message.contains("Missing required encoding tag"));
+                assert!(message.contains("wrong signer"));
+            }
+            other => panic!(
+                "Expected InvalidInput incompatibility error, got: {:?}",
+                other
+            ),
+        }
+    }
 
     #[tokio::test]
     async fn test_create_group() {
