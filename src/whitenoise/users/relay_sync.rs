@@ -3,16 +3,13 @@ use std::collections::HashSet;
 use chrono::{DateTime, Utc};
 use nostr_sdk::prelude::*;
 
-use crate::{
-    nostr_manager::NostrManager,
-    whitenoise::{
-        Whitenoise,
-        database::processed_events::ProcessedEvent,
-        error::Result,
-        relays::{Relay, RelayType},
-        users::User,
-        utils::timestamp_to_datetime,
-    },
+use crate::whitenoise::{
+    Whitenoise,
+    database::processed_events::ProcessedEvent,
+    error::Result,
+    relays::{Relay, RelayType},
+    users::User,
+    utils::timestamp_to_datetime,
 };
 
 impl User {
@@ -253,7 +250,7 @@ impl User {
     ) -> Result<bool> {
         let relays_urls: Vec<_> = Relay::urls(query_relays);
         let relay_event = whitenoise
-            .nostr
+            .relay_control
             .fetch_user_relays(self.pubkey, relay_type, &relays_urls)
             .await
             .map_err(|e| {
@@ -267,7 +264,8 @@ impl User {
 
         match relay_event {
             Some(event) => {
-                let relay_hashset: HashSet<_> = NostrManager::relay_urls_from_event(&event);
+                let relay_hashset: HashSet<_> =
+                    crate::nostr_manager::utils::relay_urls_from_event(&event);
                 let changed = self
                     .sync_relay_urls(
                         whitenoise,
@@ -279,7 +277,6 @@ impl User {
 
                 if changed {
                     whitenoise
-                        .nostr
                         .event_tracker
                         .track_processed_global_event(&event)
                         .await?;

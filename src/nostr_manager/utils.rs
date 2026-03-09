@@ -2,8 +2,6 @@ use std::{collections::HashSet, time::Duration};
 
 use nostr_sdk::prelude::*;
 
-use crate::nostr_manager::NostrManager;
-
 /// Maximum allowed skew for event timestamps in the future (1 hour)
 pub(crate) const MAX_FUTURE_SKEW: Duration = Duration::from_secs(60 * 60);
 
@@ -38,53 +36,55 @@ pub(crate) fn cap_timestamp_to_now(event_timestamp: Timestamp) -> Timestamp {
     }
 }
 
-impl NostrManager {
-    /// Extracts public keys from an event's tags.
-    pub(crate) fn pubkeys_from_event(event: &Event) -> Vec<PublicKey> {
-        event
-            .tags
-            .iter()
-            .filter(|tag| {
-                tag.kind() == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::P))
-            })
-            .filter_map(|tag| tag.content().and_then(|c| c.parse::<PublicKey>().ok()))
-            .collect()
-    }
+/// Extracts public keys from an event's `p` tags.
+pub(crate) fn pubkeys_from_event(event: &Event) -> Vec<PublicKey> {
+    event
+        .tags
+        .iter()
+        .filter(|tag| tag.kind() == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::P)))
+        .filter_map(|tag| tag.content().and_then(|c| c.parse::<PublicKey>().ok()))
+        .collect()
+}
 
-    /// Extracts relay URLs from an event's tags.
-    pub(crate) fn relay_urls_from_event(event: &Event) -> HashSet<RelayUrl> {
-        event
-            .tags
-            .iter()
-            .filter(|tag| Self::is_relay_list_tag_for_event_kind(tag, event.kind))
-            .filter_map(|tag| {
-                tag.content()
-                    .and_then(|content| RelayUrl::parse(content).ok())
-            })
-            .collect()
-    }
+/// Extracts relay URLs from an event's tags.
+pub(crate) fn relay_urls_from_event(event: &Event) -> HashSet<RelayUrl> {
+    event
+        .tags
+        .iter()
+        .filter(|tag| is_relay_list_tag_for_event_kind(tag, event.kind))
+        .filter_map(|tag| {
+            tag.content()
+                .and_then(|content| RelayUrl::parse(content).ok())
+        })
+        .collect()
+}
 
-    /// Determines if a tag is relevant for the given relay list event kind.
-    /// Different relay list kinds use different tag types:
-    /// - Kind::RelayList (10002) uses "r" tags (TagKind::SingleLetter)
-    /// - Kind::InboxRelays (10050) and Kind::MlsKeyPackageRelays (10051) use "relay" tags (TagKind::Relay)
-    pub(crate) fn is_relay_list_tag_for_event_kind(tag: &Tag, kind: Kind) -> bool {
-        match kind {
-            Kind::RelayList => Self::is_r_tag(tag),
-            Kind::InboxRelays | Kind::MlsKeyPackageRelays => Self::is_relay_tag(tag),
-            _ => Self::is_relay_tag(tag) || Self::is_r_tag(tag), // backward compatibility
-        }
+/// Determines if a tag is relevant for the given relay list event kind.
+/// Different relay list kinds use different tag types:
+/// - Kind::RelayList (10002) uses "r" tags (TagKind::SingleLetter)
+/// - Kind::InboxRelays (10050) and Kind::MlsKeyPackageRelays (10051) use "relay" tags (TagKind::Relay)
+pub(crate) fn is_relay_list_tag_for_event_kind(tag: &Tag, kind: Kind) -> bool {
+    match kind {
+        Kind::RelayList => is_r_tag(tag),
+        Kind::InboxRelays | Kind::MlsKeyPackageRelays => is_relay_tag(tag),
+        _ => is_relay_tag(tag) || is_r_tag(tag), // backward compatibility
     }
+}
 
-    /// Checks if a tag is an "r" tag.
-    pub(crate) fn is_r_tag(tag: &Tag) -> bool {
-        tag.kind() == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::R))
-    }
+/// Checks if a tag is an "r" tag.
+///
+/// Recognizes both `TagKind::SingleLetter('r')` (canonical) and `TagKind::custom("r")`
+/// (produced by some clients) so that relay-list events are not incorrectly rejected.
+pub(crate) fn is_r_tag(tag: &Tag) -> bool {
+    matches!(
+        tag.kind(),
+        TagKind::SingleLetter(s) if s == SingleLetterTag::lowercase(Alphabet::R)
+    ) || tag.kind() == TagKind::Custom(std::borrow::Cow::Borrowed("r"))
+}
 
-    /// Checks if a tag is a "relay" tag.
-    pub(crate) fn is_relay_tag(tag: &Tag) -> bool {
-        tag.kind() == TagKind::Relay
-    }
+/// Checks if a tag is a "relay" tag.
+pub(crate) fn is_relay_tag(tag: &Tag) -> bool {
+    tag.kind() == TagKind::Relay
 }
 
 #[cfg(test)]
@@ -111,7 +111,7 @@ mod tests {
             .await
             .unwrap();
 
-        let parsed_relays = NostrManager::relay_urls_from_event(&event);
+        let parsed_relays = relay_urls_from_event(&event);
 
         assert_eq!(parsed_relays.len(), 2);
         assert!(parsed_relays.contains(&RelayUrl::parse("wss://relay1.example.com").unwrap()));
@@ -139,7 +139,7 @@ mod tests {
             .await
             .unwrap();
 
-        let parsed_relays = NostrManager::relay_urls_from_event(&event);
+        let parsed_relays = relay_urls_from_event(&event);
 
         assert_eq!(parsed_relays.len(), 2);
         assert!(parsed_relays.contains(&RelayUrl::parse("wss://inbox1.example.com").unwrap()));
@@ -167,7 +167,7 @@ mod tests {
             .await
             .unwrap();
 
-        let parsed_relays = NostrManager::relay_urls_from_event(&event);
+        let parsed_relays = relay_urls_from_event(&event);
 
         assert_eq!(parsed_relays.len(), 2);
         assert!(parsed_relays.contains(&RelayUrl::parse("wss://keypackage1.example.com").unwrap()));
@@ -193,7 +193,7 @@ mod tests {
             .await
             .unwrap();
 
-        let parsed_relays = NostrManager::relay_urls_from_event(&event);
+        let parsed_relays = relay_urls_from_event(&event);
 
         assert_eq!(parsed_relays.len(), 2);
         assert!(parsed_relays.contains(&RelayUrl::parse("wss://r-tag-relay.example.com").unwrap()));
@@ -221,7 +221,7 @@ mod tests {
             .await
             .unwrap();
 
-        let parsed_relays = NostrManager::relay_urls_from_event(&event);
+        let parsed_relays = relay_urls_from_event(&event);
 
         assert_eq!(parsed_relays.len(), 2);
         assert!(parsed_relays.contains(&RelayUrl::parse("wss://valid-relay.example.com").unwrap()));
@@ -248,7 +248,7 @@ mod tests {
             .await
             .unwrap();
 
-        let parsed_relays = NostrManager::relay_urls_from_event(&event);
+        let parsed_relays = relay_urls_from_event(&event);
         assert!(parsed_relays.is_empty());
     }
 
@@ -270,7 +270,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = NostrManager::pubkeys_from_event(&event);
+        let result = pubkeys_from_event(&event);
 
         assert_eq!(result.len(), 2);
         assert!(result.contains(&pubkey1));
@@ -286,7 +286,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = NostrManager::pubkeys_from_event(&event);
+        let result = pubkeys_from_event(&event);
 
         assert_eq!(result.len(), 0);
     }
@@ -309,7 +309,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = NostrManager::pubkeys_from_event(&event);
+        let result = pubkeys_from_event(&event);
 
         assert_eq!(result.len(), 0);
     }
@@ -334,7 +334,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = NostrManager::pubkeys_from_event(&event);
+        let result = pubkeys_from_event(&event);
 
         assert_eq!(result.len(), 0);
     }
@@ -359,7 +359,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = NostrManager::pubkeys_from_event(&event);
+        let result = pubkeys_from_event(&event);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], valid_pubkey);
@@ -378,7 +378,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = NostrManager::pubkeys_from_event(&event);
+        let result = pubkeys_from_event(&event);
 
         // Should contain duplicates as the method doesn't deduplicate
         assert_eq!(result.len(), 2);
@@ -400,7 +400,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = NostrManager::pubkeys_from_event(&event);
+        let result = pubkeys_from_event(&event);
 
         assert_eq!(result.len(), 0);
     }

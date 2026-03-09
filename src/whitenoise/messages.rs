@@ -60,7 +60,7 @@ impl Whitenoise {
                     mdk_core::error::Error::MessageNotFound,
                 ))?;
 
-        let tokens = self.nostr.parse(&mdk_message.content);
+        let tokens = self.content_parser.parse(&mdk_message.content);
 
         // Proactive caching + delivery tracking for all outgoing event kinds.
         // Kind 9 (chat): full message processing + NewMessage emission
@@ -87,7 +87,7 @@ impl Whitenoise {
 
         // Spawn background publish task with retries + delivery tracking for all kinds.
         // On failure for kind 7/5, cascade by reversing the optimistic aggregated effect.
-        let nostr = self.nostr.clone();
+        let ephemeral = self.relay_control.ephemeral();
         let event_id_str = event_id.to_string();
         let account_pubkey = account.pubkey;
         let database = self.database.clone();
@@ -98,8 +98,8 @@ impl Whitenoise {
         let reaction_content = mdk_message.content.clone();
 
         tokio::spawn(async move {
-            let success = nostr
-                .publish_with_retries(
+            let success = ephemeral
+                .publish_message_event(
                     message_event,
                     &account_pubkey,
                     &group_relays,
@@ -143,7 +143,7 @@ impl Whitenoise {
             .message_aggregator
             .process_single_message(
                 mdk_message,
-                &self.nostr,
+                &self.content_parser,
                 MediaFile::find_by_group(&self.database, group_id).await?,
             )
             .await
@@ -542,7 +542,7 @@ impl Whitenoise {
         // Mark the original message as Retried so it's excluded from future snapshots.
         // This is best-effort: if it fails, the user sees a duplicate (original Failed +
         // new Sending) which is harmless and self-corrects on next app restart.
-        match AggregatedMessage::update_delivery_status(
+        match AggregatedMessage::update_delivery_status_with_retry(
             &event_id_str,
             group_id,
             &DeliveryStatus::Retried,
@@ -593,7 +593,7 @@ impl Whitenoise {
             .iter()
             .map(|message| MessageWithTokens {
                 message: message.clone(),
-                tokens: self.nostr.parse(&message.content),
+                tokens: self.content_parser.parse(&message.content),
             })
             .collect::<Vec<MessageWithTokens>>();
         Ok(messages_with_tokens)
@@ -775,7 +775,7 @@ impl Whitenoise {
                 pubkey,
                 group_id,
                 new_events.clone(),
-                &self.nostr,
+                &self.content_parser,
                 media_files,
             )
             .await
@@ -1714,7 +1714,8 @@ mod tests {
             original_msg.delivery_status
         );
 
-        // A new message should exist in cache with Sending status and same content
+        // A new message should exist in cache in a non-failure state.
+        // The background publish may complete before we read, so accept Sending OR Sent.
         let all_messages =
             AggregatedMessage::find_messages_by_group(&group.mls_group_id, &whitenoise.database)
                 .await
@@ -1725,10 +1726,13 @@ mod tests {
             .iter()
             .find(|m| m.content == "Retry happy path" && m.id != original_event_id.to_string())
             .expect("New retry message should exist in cache");
-        assert_eq!(
-            new_msg.delivery_status,
-            Some(DeliveryStatus::Sending),
-            "New message should have Sending status"
+        assert!(
+            matches!(
+                new_msg.delivery_status,
+                Some(DeliveryStatus::Sending) | Some(DeliveryStatus::Sent(_))
+            ),
+            "New message should have Sending or Sent status, got {:?}",
+            new_msg.delivery_status
         );
 
         let retried_update = tokio::time::timeout(Duration::from_secs(5), async {
@@ -1790,18 +1794,32 @@ mod tests {
                 .unwrap();
         assert_eq!(msg.delivery_status, Some(DeliveryStatus::Sending));
 
-        // Build a test event for publish_with_retries
+        // Build a test event for bounded relay-control publish
         let keys = Keys::generate();
         let event = EventBuilder::text_note("test")
             .sign_with_keys(&keys)
             .unwrap();
 
-        // Call publish_with_retries directly with unreachable relays
+        // Call the relay-control publish helper directly with unreachable relays.
+        // Use max_publish_attempts=1 so there are no retry sleeps and the test
+        // runs without needing to pause the Tokio clock (which would break DB
+        // pool timeouts on the status-update write inside publish_message_event).
         let unreachable_relays = vec![RelayUrl::parse("ws://127.0.0.1:1").unwrap()];
+        let ephemeral = crate::relay_control::ephemeral::EphemeralPlane::new(
+            crate::relay_control::ephemeral::EphemeralPlaneConfig {
+                timeout: std::time::Duration::from_millis(200),
+                reconnect_policy:
+                    crate::relay_control::sessions::RelaySessionReconnectPolicy::Disabled,
+                auth_policy: crate::relay_control::sessions::RelaySessionAuthPolicy::Disabled,
+                max_publish_attempts: 1,
+            },
+            whitenoise.database.clone(),
+            whitenoise.event_sender.clone(),
+            whitenoise.relay_control.observability().clone(),
+        );
 
-        whitenoise
-            .nostr
-            .publish_with_retries(
+        ephemeral
+            .publish_message_event(
                 event,
                 &creator.pubkey,
                 &unreachable_relays,

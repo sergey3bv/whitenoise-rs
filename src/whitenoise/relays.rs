@@ -145,20 +145,37 @@ impl Whitenoise {
             unique_relay_urls.insert(relay.url);
         }
 
-        // Get current relay statuses from the Nostr client
+        // Get current relay statuses from the relay_status DB table
         let mut relay_statuses = Vec::new();
 
         for relay_url in unique_relay_urls {
-            // Try to get relay status from NostrManager
-            match self.nostr.get_relay_status(&relay_url).await {
-                Ok(status) => {
-                    relay_statuses.push((relay_url, status));
-                }
-                Err(_) => {
-                    // If we can't get the relay status, it's likely not connected
-                    relay_statuses.push((relay_url, RelayStatus::Disconnected));
-                }
-            }
+            let status =
+                crate::whitenoise::database::relay_status::RelayStatusRecord::find_any_plane(
+                    &relay_url,
+                    &self.database,
+                )
+                .await
+                .ok()
+                .flatten()
+                .map(|s| {
+                    // A relay is currently connected when it has a recorded
+                    // success and that success is more recent than any failure.
+                    // Using timestamps rather than the cumulative success_count
+                    // prevents a relay that once connected but has since
+                    // disconnected from appearing as Connected indefinitely.
+                    let connected = match (s.last_connect_success_at, s.last_failure_at) {
+                        (Some(success), Some(failure)) => success > failure,
+                        (Some(_), None) => true,
+                        _ => false,
+                    };
+                    if connected {
+                        RelayStatus::Connected
+                    } else {
+                        RelayStatus::Disconnected
+                    }
+                })
+                .unwrap_or(RelayStatus::Disconnected);
+            relay_statuses.push((relay_url, status));
         }
 
         Ok(relay_statuses)

@@ -135,7 +135,7 @@ impl Whitenoise {
 
                 mdk.merge_pending_commit(group_id)?;
 
-                self.nostr
+                self.relay_control
                     .publish_event_to(
                         update_result.evolution_event.clone(),
                         &account.pubkey,
@@ -291,7 +291,7 @@ impl Whitenoise {
 
         let mut chat_message = self
             .message_aggregator
-            .process_single_message(message, &self.nostr, media_files)
+            .process_single_message(message, &self.content_parser, media_files)
             .await?;
 
         // Preserve existing delivery status for relay echoes of locally-sent messages.
@@ -1236,7 +1236,7 @@ mod tests {
         // Fetch the member's key package from relays
         let relay_urls = Relay::urls(&member_account.key_package_relays(whitenoise).await.unwrap());
         let key_pkg_event = whitenoise
-            .nostr
+            .relay_control
             .fetch_user_key_package(member_account.pubkey, &relay_urls)
             .await
             .unwrap()
@@ -1446,7 +1446,7 @@ mod tests {
         let sub_id = format!(
             "{}_mls_messages",
             hash_pubkey_for_subscription_id(
-                whitenoise.nostr.session_salt(),
+                whitenoise.relay_control.session_salt(),
                 &creator_account.pubkey
             )
         );
@@ -1461,7 +1461,6 @@ mod tests {
             .await;
 
         let tracked_after_first = whitenoise
-            .nostr
             .event_tracker
             .already_processed_account_event(&event_id, &creator_account.pubkey)
             .await
@@ -1485,7 +1484,6 @@ mod tests {
 
         // Still tracked — no double-entry, no crash.
         let tracked_after_second = whitenoise
-            .nostr
             .event_tracker
             .already_processed_account_event(&event_id, &creator_account.pubkey)
             .await

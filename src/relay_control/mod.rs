@@ -1,8 +1,9 @@
 //! Internal relay-control boundary.
 //!
 //! Long-lived discovery, group, and account-inbox subscriptions now run
-//! through dedicated relay-plane sessions. Query and publish flows still use
-//! the legacy `NostrManager` compatibility path until later migration phases.
+//! through dedicated relay-plane sessions. Query and one-off publish flows now
+//! run through dedicated relay-control sessions as the legacy shared-client
+//! compatibility layer is retired incrementally.
 #![allow(clippy::large_enum_variant)]
 
 use core::str::FromStr;
@@ -28,6 +29,7 @@ pub(crate) mod sessions;
 
 use crate::whitenoise::database::{Database, DatabaseError};
 use crate::{
+    RelayType,
     nostr_manager::Result as NostrResult,
     types::{AccountInboxPlanesStateSnapshot, ProcessableEvent, RelayControlStateSnapshot},
 };
@@ -47,6 +49,7 @@ pub(crate) struct RelayControlPlane {
     discovery: discovery::DiscoveryPlane,
     account_inbox_planes: RwLock<HashMap<PublicKey, account_inbox::AccountInboxPlane>>,
     group_plane: groups::GroupPlane,
+    ephemeral: ephemeral::EphemeralPlane,
     router: router::RelayRouter,
     observability: observability::RelayObservability,
     telemetry_persistors_started: AtomicBool,
@@ -70,6 +73,12 @@ impl RelayControlPlane {
             event_sender.clone(),
         );
         let group_plane = groups::GroupPlane::new(event_sender.clone(), session_salt);
+        let ephemeral = ephemeral::EphemeralPlane::new(
+            ephemeral::EphemeralPlaneConfig::default(),
+            database.clone(),
+            event_sender.clone(),
+            observability.clone(),
+        );
 
         Self {
             database,
@@ -78,6 +87,7 @@ impl RelayControlPlane {
             discovery,
             account_inbox_planes: RwLock::new(HashMap::new()),
             group_plane,
+            ephemeral,
             router: router::RelayRouter::default(),
             observability,
             telemetry_persistors_started: AtomicBool::new(false),
@@ -288,6 +298,20 @@ impl RelayControlPlane {
         self.group_plane.remove_account(account_pubkey).await;
     }
 
+    /// Deactivates all account subscriptions. Called during full data teardown.
+    pub(crate) async fn shutdown_all(&self) {
+        let pubkeys: Vec<_> = self
+            .account_inbox_planes
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect();
+        for pubkey in pubkeys {
+            self.deactivate_account_subscriptions(&pubkey).await;
+        }
+    }
+
     pub(crate) async fn has_account_subscriptions(&self, account_pubkey: &PublicKey) -> bool {
         // Both planes must confirm the account is active. The group plane
         // keeps an entry even for accounts with zero groups (empty state), so
@@ -319,6 +343,130 @@ impl RelayControlPlane {
     /// Discovery-plane configuration, including the configured relay set.
     pub(crate) fn discovery(&self) -> &discovery::DiscoveryPlane {
         &self.discovery
+    }
+
+    pub(crate) fn ephemeral(&self) -> ephemeral::EphemeralPlane {
+        self.ephemeral.clone()
+    }
+
+    pub(crate) async fn fetch_metadata_from(
+        &self,
+        relays: &[RelayUrl],
+        pubkey: PublicKey,
+    ) -> NostrResult<Option<nostr_sdk::Event>> {
+        self.ephemeral.fetch_metadata_from(relays, pubkey).await
+    }
+
+    pub(crate) async fn fetch_user_relays(
+        &self,
+        pubkey: PublicKey,
+        relay_type: RelayType,
+        relays: &[RelayUrl],
+    ) -> NostrResult<Option<nostr_sdk::Event>> {
+        self.ephemeral
+            .fetch_user_relays(pubkey, relay_type, relays)
+            .await
+    }
+
+    pub(crate) async fn fetch_user_key_package(
+        &self,
+        pubkey: PublicKey,
+        relays: &[RelayUrl],
+    ) -> NostrResult<Option<nostr_sdk::Event>> {
+        self.ephemeral.fetch_user_key_package(pubkey, relays).await
+    }
+
+    pub(crate) async fn publish_welcome(
+        &self,
+        receiver: &PublicKey,
+        rumor: nostr_sdk::UnsignedEvent,
+        extra_tags: &[nostr_sdk::Tag],
+        account_pubkey: PublicKey,
+        relays: &[RelayUrl],
+        signer: Arc<dyn nostr_sdk::NostrSigner>,
+    ) -> NostrResult<nostr_sdk::prelude::Output<nostr_sdk::EventId>> {
+        self.ephemeral
+            .publish_gift_wrap_to(receiver, rumor, extra_tags, account_pubkey, relays, signer)
+            .await
+    }
+
+    pub(crate) async fn publish_event_to(
+        &self,
+        event: nostr_sdk::Event,
+        account_pubkey: &PublicKey,
+        relays: &[RelayUrl],
+    ) -> NostrResult<nostr_sdk::prelude::Output<nostr_sdk::EventId>> {
+        self.ephemeral
+            .publish_event_to(event, account_pubkey, relays)
+            .await
+    }
+
+    pub(crate) async fn publish_metadata_with_signer(
+        &self,
+        metadata: &nostr_sdk::Metadata,
+        relays: &[RelayUrl],
+        signer: Arc<dyn nostr_sdk::NostrSigner>,
+    ) -> NostrResult<nostr_sdk::prelude::Output<nostr_sdk::EventId>> {
+        self.ephemeral
+            .publish_metadata_with_signer(metadata, relays, signer)
+            .await
+    }
+
+    pub(crate) async fn publish_relay_list_with_signer(
+        &self,
+        relay_list: &[RelayUrl],
+        relay_type: RelayType,
+        target_relays: &[RelayUrl],
+        signer: Arc<dyn nostr_sdk::NostrSigner>,
+    ) -> NostrResult<()> {
+        self.ephemeral
+            .publish_relay_list_with_signer(relay_list, relay_type, target_relays, signer)
+            .await
+    }
+
+    pub(crate) async fn publish_follow_list_with_signer(
+        &self,
+        follow_list: &[PublicKey],
+        target_relays: &[RelayUrl],
+        signer: Arc<dyn nostr_sdk::NostrSigner>,
+    ) -> NostrResult<()> {
+        self.ephemeral
+            .publish_follow_list_with_signer(follow_list, target_relays, signer)
+            .await
+    }
+
+    pub(crate) async fn publish_key_package_with_signer(
+        &self,
+        encoded_key_package: &str,
+        relays: &[RelayUrl],
+        tags: &[nostr_sdk::Tag],
+        signer: Arc<dyn nostr_sdk::NostrSigner>,
+    ) -> NostrResult<nostr_sdk::prelude::Output<nostr_sdk::EventId>> {
+        self.ephemeral
+            .publish_key_package_with_signer(encoded_key_package, relays, tags, signer)
+            .await
+    }
+
+    pub(crate) async fn publish_event_deletion_with_signer(
+        &self,
+        event_id: &nostr_sdk::EventId,
+        relays: &[RelayUrl],
+        signer: Arc<dyn nostr_sdk::NostrSigner>,
+    ) -> NostrResult<nostr_sdk::prelude::Output<nostr_sdk::EventId>> {
+        self.ephemeral
+            .publish_event_deletion_with_signer(event_id, relays, signer)
+            .await
+    }
+
+    pub(crate) async fn publish_batch_event_deletion_with_signer(
+        &self,
+        event_ids: &[nostr_sdk::EventId],
+        relays: &[RelayUrl],
+        signer: Arc<dyn nostr_sdk::NostrSigner>,
+    ) -> NostrResult<nostr_sdk::prelude::Output<nostr_sdk::EventId>> {
+        self.ephemeral
+            .publish_batch_event_deletion_with_signer(event_ids, relays, signer)
+            .await
     }
 
     pub(crate) async fn snapshot(&self) -> RelayControlStateSnapshot {
@@ -462,9 +610,7 @@ mod tests {
 
     use super::*;
     use crate::relay_control::observability::{RelayTelemetry, RelayTelemetryKind};
-    use crate::whitenoise::database::{
-        Database, relay_events::RelayEventRecord, relay_status::RelayStatusRecord,
-    };
+    use crate::whitenoise::database::{Database, relay_status::RelayStatusRecord};
 
     #[test]
     fn test_relay_plane_as_str() {
@@ -523,26 +669,18 @@ mod tests {
         telemetry_sender.send(telemetry).unwrap();
         drop(telemetry_sender);
 
+        // SubscriptionSuccess no longer writes to relay_events (Fix 6); verify
+        // via relay_status counters instead.
         timeout(Duration::from_secs(1), async {
             loop {
-                let events = RelayEventRecord::list_recent_for_scope(
-                    &relay_url,
-                    RelayPlane::Discovery,
-                    None,
-                    10,
-                    &database,
-                )
-                .await
-                .unwrap();
-
                 let status =
                     RelayStatusRecord::find(&relay_url, RelayPlane::Discovery, None, &database)
                         .await
                         .unwrap();
 
-                if events.len() == 1 {
-                    assert_eq!(events[0].subscription_id.as_deref(), Some("sub-1"));
-                    assert_eq!(status.unwrap().success_count, 1);
+                if let Some(s) = status
+                    && s.success_count == 1
+                {
                     break;
                 }
 
@@ -579,18 +717,10 @@ mod tests {
             .unwrap();
         drop(account_sender);
 
+        // SubscriptionSuccess no longer writes to relay_events (Fix 6); check
+        // relay_status success_count reached 2 instead.
         timeout(Duration::from_secs(1), async {
             loop {
-                let events = RelayEventRecord::list_recent_for_scope(
-                    &relay_url,
-                    RelayPlane::AccountInbox,
-                    Some(account_pubkey),
-                    10,
-                    &database,
-                )
-                .await
-                .unwrap();
-
                 let status = RelayStatusRecord::find(
                     &relay_url,
                     RelayPlane::AccountInbox,
@@ -600,13 +730,10 @@ mod tests {
                 .await
                 .unwrap();
 
-                if events.len() == 2 {
-                    assert_eq!(events[0].subscription_id.as_deref(), Some("account-sub-2"));
-                    assert_eq!(events[0].account_pubkey, Some(account_pubkey));
-
-                    let status = status.unwrap();
-                    assert_eq!(status.account_pubkey, Some(account_pubkey));
-                    assert_eq!(status.success_count, 2);
+                if let Some(s) = status
+                    && s.success_count == 2
+                {
+                    assert_eq!(s.account_pubkey, Some(account_pubkey));
                     break;
                 }
 

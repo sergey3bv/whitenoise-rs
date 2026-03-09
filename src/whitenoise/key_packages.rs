@@ -303,7 +303,12 @@ impl Whitenoise {
             self.encoded_key_package(account, &relays).await?;
         let relay_urls = Relay::urls(&relays);
         let event_id = self
-            .publish_key_package_to_relays(&encoded_key_package, &relay_urls, &tags, signer)
+            .publish_key_package_to_relays(
+                &encoded_key_package,
+                &relay_urls,
+                &tags,
+                std::sync::Arc::new(signer),
+            )
             .await?;
         self.track_published_key_package(account, &hash_ref, &event_id)
             .await;
@@ -342,10 +347,10 @@ impl Whitenoise {
         encoded_key_package: &str,
         relay_urls: &[RelayUrl],
         tags: &[Tag],
-        signer: impl NostrSigner + 'static,
+        signer: std::sync::Arc<dyn NostrSigner>,
     ) -> Result<EventId> {
         let result = self
-            .nostr
+            .relay_control
             .publish_key_package_with_signer(encoded_key_package, relay_urls, tags, signer)
             .await?;
 
@@ -428,7 +433,7 @@ impl Whitenoise {
             account,
             event_id,
             delete_mls_stored_keys,
-            signer,
+            std::sync::Arc::new(signer),
         )
         .await
     }
@@ -438,7 +443,7 @@ impl Whitenoise {
         account: &Account,
         event_id: &EventId,
         delete_mls_stored_keys: bool,
-        signer: impl NostrSigner + 'static,
+        signer: std::sync::Arc<dyn NostrSigner>,
     ) -> Result<bool> {
         // Delete local MLS key material using the hash_ref stored at publish time.
         // This avoids a relay round-trip to fetch and parse the key package event.
@@ -497,7 +502,7 @@ impl Whitenoise {
         let key_package_relays_urls = Relay::urls(&key_package_relays);
 
         let result = self
-            .nostr
+            .relay_control
             .publish_event_deletion_with_signer(event_id, &key_package_relays_urls, signer)
             .await?;
         Ok(!result.success.is_empty())
@@ -539,16 +544,12 @@ impl Whitenoise {
             .kind(Kind::MlsKeyPackage)
             .author(account.pubkey);
 
-        let mut key_package_stream = self
-            .nostr
-            .client
-            .stream_events_from(relay_urls, key_package_filter, Duration::from_secs(10))
+        let fetched = self
+            .relay_control
+            .ephemeral()
+            .fetch_events_from(&relay_urls, key_package_filter)
             .await?;
-
-        let mut key_package_events = Vec::new();
-        while let Some(event) = key_package_stream.next().await {
-            key_package_events.push(event);
-        }
+        let key_package_events: Vec<Event> = fetched.into_iter().collect();
 
         let (key_package_events, dropped_wrong_kind, dropped_wrong_author) =
             filter_key_package_events_for_account(account.pubkey, key_package_events);
@@ -633,10 +634,14 @@ impl Whitenoise {
         &self,
         account: &Account,
         delete_mls_stored_keys: bool,
-        signer: impl NostrSigner + Clone + 'static,
+        signer: impl NostrSigner + 'static,
     ) -> Result<usize> {
-        self.delete_all_key_packages_loop(account, delete_mls_stored_keys, signer)
-            .await
+        self.delete_all_key_packages_loop(
+            account,
+            delete_mls_stored_keys,
+            std::sync::Arc::new(signer),
+        )
+        .await
     }
 
     /// Loops fetch-delete rounds until no key packages remain on relays, up to
@@ -647,7 +652,7 @@ impl Whitenoise {
         &self,
         account: &Account,
         delete_mls_stored_keys: bool,
-        signer: impl NostrSigner + Clone + 'static,
+        signer: std::sync::Arc<dyn NostrSigner>,
     ) -> Result<usize> {
         let mut total_deleted = 0;
 
@@ -748,7 +753,7 @@ impl Whitenoise {
         key_package_events: Vec<Event>,
         delete_mls_stored_keys: bool,
         max_retries: u32,
-        signer: impl NostrSigner + Clone + 'static,
+        signer: std::sync::Arc<dyn NostrSigner>,
     ) -> Result<usize> {
         if key_package_events.is_empty() {
             tracing::debug!(
@@ -894,11 +899,11 @@ impl Whitenoise {
         &self,
         event_ids: &[EventId],
         relay_urls: &[RelayUrl],
-        signer: impl NostrSigner + 'static,
+        signer: std::sync::Arc<dyn NostrSigner>,
         context: &str,
     ) -> Result<()> {
         match self
-            .nostr
+            .relay_control
             .publish_batch_event_deletion_with_signer(event_ids, relay_urls, signer)
             .await
         {
@@ -1022,8 +1027,9 @@ mod tests {
             .store_private_key(&keys)
             .expect("Should store keys");
         let user = account.user(&whitenoise.database).await.unwrap();
+        // Use a loopback IP so connection refusal is instant (no DNS lookup).
         let relay = crate::whitenoise::relays::Relay::find_or_create_by_url(
-            &RelayUrl::parse("wss://unreachable.test.relay").unwrap(),
+            &RelayUrl::parse("ws://127.0.0.1:1").unwrap(),
             &whitenoise.database,
         )
         .await
@@ -1637,8 +1643,10 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = create_account_with_relay(&whitenoise).await;
 
-        // With no real relay connected, publish will fail after all retry attempts
+        // Pause time so exponential backoff sleeps complete instantly.
+        tokio::time::pause();
         let result = whitenoise.publish_key_package_for_account(&account).await;
+        tokio::time::resume();
         assert!(result.is_err(), "Should fail when relay is unreachable");
     }
 
@@ -1648,9 +1656,12 @@ mod tests {
         let account = create_account_with_relay(&whitenoise).await;
 
         let relays = account.key_package_relays(&whitenoise).await.unwrap();
+        // Pause time so exponential backoff sleeps complete instantly.
+        tokio::time::pause();
         let result = whitenoise
             .create_and_publish_key_package(&account, &relays)
             .await;
+        tokio::time::resume();
         assert!(result.is_err(), "Should fail when relay is unreachable");
     }
 
@@ -1659,9 +1670,12 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = create_account_with_relay(&whitenoise).await;
 
+        // Pause time so exponential backoff sleeps complete instantly.
+        tokio::time::pause();
         let result = whitenoise
             .publish_key_package_for_account_with_signer(&account, Keys::generate())
             .await;
+        tokio::time::resume();
         assert!(result.is_err(), "Should fail when relay is unreachable");
     }
 
