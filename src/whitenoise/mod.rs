@@ -184,6 +184,8 @@ pub struct Whitenoise {
     discovery_sync_worker: discovery_sync_worker::DiscoverySyncWorker,
     /// In-memory coordination for delayed MIP-05 token-list responses.
     pending_push_token_responses: Arc<DashMap<(PublicKey, GroupId, EventId), ()>>,
+    /// Bounds the number of concurrently sleeping MIP-05 token-list response tasks.
+    pub(crate) token_response_semaphore: Arc<Semaphore>,
 }
 
 static GLOBAL_WHITENOISE: OnceCell<Whitenoise> = OnceCell::const_new();
@@ -221,6 +223,7 @@ impl std::fmt::Debug for Whitenoise {
             .field("scheduler_shutdown", &"<REDACTED>")
             .field("scheduler_handles", &"<REDACTED>")
             .field("pending_push_token_responses", &"<REDACTED>")
+            .field("token_response_semaphore", &"<REDACTED>")
             .finish()
     }
 }
@@ -267,6 +270,7 @@ impl Whitenoise {
             pending_logins: DashMap::new(),
             discovery_sync_worker: discovery_sync_worker::DiscoverySyncWorker::new(),
             pending_push_token_responses: Arc::new(DashMap::new()),
+            token_response_semaphore: Arc::new(Semaphore::new(16)),
         }
     }
 

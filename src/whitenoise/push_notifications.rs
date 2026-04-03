@@ -513,6 +513,21 @@ impl Whitenoise {
         let key = (account.pubkey, group_id.clone(), request_event_id);
         self.pending_push_token_responses.insert(key, ());
 
+        let permit = match Arc::clone(&self.token_response_semaphore).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.clear_pending_token_response(&account.pubkey, &group_id, &request_event_id);
+                tracing::warn!(
+                    target: "whitenoise::push_notifications",
+                    account = %account.pubkey.to_hex(),
+                    group_id = %hex::encode(group_id.as_slice()),
+                    request_event_id = %request_event_id.to_hex(),
+                    "Dropping MIP-05 token-list response: concurrency limit reached"
+                );
+                return;
+            }
+        };
+
         let context = PendingTokenResponseContext {
             config: self.config.clone(),
             database: Arc::clone(&self.database),
@@ -522,6 +537,7 @@ impl Whitenoise {
         let delay_ms = ::rand::rng().random_range(1_000..=3_000);
 
         tokio::spawn(async move {
+            let _permit = permit;
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
 
             if let Err(error) = context
@@ -711,6 +727,8 @@ impl Whitenoise {
     ) -> Result<()> {
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         let groups = mdk.get_groups()?;
+        let cached_group_ids =
+            GroupPushToken::group_ids_for_account(&account.pubkey, &self.database).await?;
         let mut publish_failures = Vec::new();
 
         for group in groups {
@@ -736,6 +754,22 @@ impl Whitenoise {
                 publish_failures.push(format!(
                     "{}: {error}",
                     hex::encode(group.mls_group_id.as_slice())
+                ));
+            }
+        }
+
+        for cached_group_id in cached_group_ids {
+            if let Err(error) = GroupPushToken::delete_by_member_pubkey(
+                &account.pubkey,
+                &cached_group_id,
+                &account.pubkey,
+                &self.database,
+            )
+            .await
+            {
+                publish_failures.push(format!(
+                    "{}: {error}",
+                    hex::encode(cached_group_id.as_slice())
                 ));
             }
         }
@@ -799,6 +833,18 @@ impl Whitenoise {
             &self.database,
         )
         .await?;
+
+        if !AccountSettings::notifications_enabled_for_pubkey(&account.pubkey, &self.database)
+            .await?
+        {
+            GroupPushToken::delete_by_member_pubkey(
+                &account.pubkey,
+                mls_group_id,
+                &account.pubkey,
+                &self.database,
+            )
+            .await?;
+        }
 
         Ok(())
     }
@@ -1548,5 +1594,95 @@ mod tests {
         assert_eq!(PushPlatform::from_str("apns").unwrap(), PushPlatform::Apns);
         assert_eq!(PushPlatform::from_str("fcm").unwrap(), PushPlatform::Fcm);
         assert!(PushPlatform::from_str("APNS").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_schedule_pending_token_response_tracks_request_when_permit_available() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[2u8; 32]);
+        let request_event_id = EventId::from_slice(&[3u8; 32]).unwrap();
+
+        whitenoise.schedule_pending_token_response(
+            account.clone(),
+            group_id.clone(),
+            request_event_id,
+        );
+
+        assert!(whitenoise.has_pending_token_response(
+            &account.pubkey,
+            &group_id,
+            &request_event_id,
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_remove_local_push_token_cleans_cached_group_without_active_membership() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[4u8; 32]);
+        let server_pubkey = Keys::generate().public_key();
+        let relay_hint = RelayUrl::parse("wss://push.example.com").unwrap();
+
+        GroupPushToken::upsert(
+            &account.pubkey,
+            &group_id,
+            &account.pubkey,
+            0,
+            &server_pubkey,
+            Some(&relay_hint),
+            "cached-ciphertext",
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        let cached_before = GroupPushToken::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert!(!cached_before.is_empty());
+
+        whitenoise
+            .remove_local_push_token_from_joined_groups(&account)
+            .await
+            .unwrap();
+
+        let cached_after = GroupPushToken::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert!(cached_after.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_schedule_pending_token_response_drops_when_semaphore_full() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[1u8; 32]);
+        let request_event_id = EventId::all_zeros();
+
+        let _permits = Arc::clone(&whitenoise.token_response_semaphore)
+            .acquire_many_owned(16)
+            .await
+            .unwrap();
+
+        whitenoise.schedule_pending_token_response(
+            account.clone(),
+            group_id.clone(),
+            request_event_id,
+        );
+
+        assert!(!whitenoise.has_pending_token_response(
+            &account.pubkey,
+            &group_id,
+            &request_event_id,
+        ));
     }
 }
